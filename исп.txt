@@ -1,0 +1,73 @@
+#!/bin/bash
+# ===== ISP: настройка маршрутизатора =====
+set -euo pipefail
+LOGFILE="/root/isp_setup.log"
+exec > >(tee -a "$LOGFILE") 2>&1
+
+# ---------- ПЕРЕМЕННЫЕ (изменить при необходимости) ----------
+HOSTNAME="isp.au-team.irpo"
+WAN_IF="ens3"                 # интерфейс в Интернет (DHCP)
+LAN_HQ_IF="ens4"              # к HQ-RTR
+LAN_BR_IF="ens5"              # к BR-RTR
+IP_HQ_LINK="172.16.1.1/28"    # IP на интерфейсе к HQ-RTR
+IP_BR_LINK="172.16.2.1/28"    # IP на интерфейсе к BR-RTR
+# Для варианта ПА со статикой раскомментировать:
+# WAN_IP="192.168.1.1/28"    # адрес ISP в статическом варианте
+# WAN_GW="192.168.1.1"       # шлюз по умолчанию (обычно провайдер)
+# -------------------------------------------------------------
+
+# Утилиты
+apt-get update
+apt-get install -y frr iptables chrony || true
+
+# 1. Имя хоста
+hostnamectl set-hostname "$HOSTNAME"
+
+# 2. Настройка интерфейсов
+# Внешний интерфейс — DHCP
+cat > /etc/net/ifaces/${WAN_IF}/options <<EOF
+TYPE=eth
+BOOTPROTO=dhcp
+ONBOOT=yes
+EOF
+
+# Внутренний интерфейс к HQ-RTR
+mkdir -p /etc/net/ifaces/${LAN_HQ_IF}
+cat > /etc/net/ifaces/${LAN_HQ_IF}/options <<EOF
+TYPE=eth
+BOOTPROTO=static
+ONBOOT=yes
+ADDRESS="$IP_HQ_LINK"
+EOF
+
+# Внутренний интерфейс к BR-RTR
+mkdir -p /etc/net/ifaces/${LAN_BR_IF}
+cat > /etc/net/ifaces/${LAN_BR_IF}/options <<EOF
+TYPE=eth
+BOOTPROTO=static
+ONBOOT=yes
+ADDRESS="$IP_BR_LINK"
+EOF
+
+# Применяем настройки сети
+systemctl restart network
+
+# 3. Включение IP forwarding
+echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+sysctl -p
+
+# 4. NAT на внешний интерфейс
+iptables -t nat -A POSTROUTING -o ${WAN_IF} -j MASQUERADE
+iptables -A FORWARD -i ${WAN_IF} -o ${LAN_HQ_IF} -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -A FORWARD -i ${LAN_HQ_IF} -o ${WAN_IF} -j ACCEPT
+iptables -A FORWARD -i ${WAN_IF} -o ${LAN_BR_IF} -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -A FORWARD -i ${LAN_BR_IF} -o ${WAN_IF} -j ACCEPT
+# Сохраняем правила
+iptables-save > /etc/sysconfig/iptables
+systemctl enable iptables
+
+# 5. Маршрут по умолчанию (для DHCP появится автоматически, для статики добавить)
+# В случае статики раскомментировать:
+# ip route add default via "$WAN_GW" || true
+
+echo "ISP setup completed."
