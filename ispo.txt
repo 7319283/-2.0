@@ -1,0 +1,129 @@
+#!/bin/bash
+# ===== ISP: БЕЗОПАСНАЯ настройка (одна попытка) =====
+set -euo pipefail
+LOGFILE="/root/isp_setup.log"
+exec > >(tee -a "$LOGFILE") 2>&1
+
+echo "=== ЗАПУСК БЕЗОПАСНОЙ НАСТРОЙКИ ISP ==="
+echo "Время: $(date)"
+echo "======================================="
+
+# ---------- ПЕРЕМЕННЫЕ (проверь перед запуском!) ----------
+HOSTNAME="isp.au-team.irpo"
+WAN_IF="ens18"
+LAN_HQ_IF="ens19"
+LAN_BR_IF="ens20"
+IP_HQ_LINK="172.16.1.1/28"
+IP_BR_LINK="172.16.2.1/28"
+
+# === 0. Проверка интерфейсов (критично!) ===
+echo "Проверка наличия интерфейсов..."
+for iface in "$WAN_IF" "$LAN_HQ_IF" "$LAN_BR_IF"; do
+    if ! ip link show "$iface" > /dev/null 2>&1; then
+        echo "ОШИБКА: Интерфейс $iface не найден!"
+        echo "Доступные интерфейсы:"
+        ip -brief link show
+        exit 1
+    fi
+    echo "✓ Интерфейс $iface найден"
+done
+
+# === 1. Бэкап текущей конфигурации ===
+echo "Создаём бэкап конфигурации..."
+BACKUP_DIR="/root/backup_isp_$(date +%H%M%S)"
+mkdir -p "$BACKUP_DIR"
+cp -a /etc/net/ifaces/ "$BACKUP_DIR/" 2>/dev/null || true
+cp /etc/sysctl.conf "$BACKUP_DIR/" 2>/dev/null || true
+iptables-save > "$BACKUP_DIR/iptables.backup" 2>/dev/null || true
+cp /etc/hostname "$BACKUP_DIR/" 2>/dev/null || true
+
+echo "Бэкап создан: $BACKUP_DIR"
+
+# === 2. Установка пакетов ===
+echo "Установка необходимых пакетов..."
+apt-get update -q
+apt-get install -y frr iptables chrony || true
+
+# === 3. Hostname ===
+echo "Установка hostname: $HOSTNAME"
+hostnamectl set-hostname "$HOSTNAME"
+echo "$HOSTNAME" > /etc/hostname
+
+# === 4. Настройка интерфейсов ===
+echo "Настройка сетевых интерфейсов..."
+
+# WAN (DHCP)
+mkdir -p "/etc/net/ifaces/${WAN_IF}"
+cat > "/etc/net/ifaces/${WAN_IF}/options" <<EOF
+TYPE=eth
+BOOTPROTO=dhcp
+ONBOOT=yes
+DISABLED=no
+NM_CONTROLLED=no
+EOF
+
+# LAN HQ
+mkdir -p "/etc/net/ifaces/${LAN_HQ_IF}"
+cat > "/etc/net/ifaces/${LAN_HQ_IF}/options" <<EOF
+TYPE=eth
+BOOTPROTO=static
+ONBOOT=yes
+DISABLED=no
+NM_CONTROLLED=no
+ADDRESS=${IP_HQ_LINK}
+EOF
+
+# LAN BR
+mkdir -p "/etc/net/ifaces/${LAN_BR_IF}"
+cat > "/etc/net/ifaces/${LAN_BR_IF}/options" <<EOF
+TYPE=eth
+BOOTPROTO=static
+ONBOOT=yes
+DISABLED=no
+NM_CONTROLLED=no
+ADDRESS=${IP_BR_LINK}
+EOF
+
+# === 5. Применение сети ===
+echo "Применяем сетевые настройки..."
+systemctl restart network
+
+sleep 3
+
+# === 6. IP Forwarding ===
+echo "Включаем IP forwarding..."
+if ! grep -q "^net.ipv4.ip_forward" /etc/sysctl.conf; then
+    echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+fi
+sysctl -p
+
+# === 7. NAT и FORWARD ===
+echo "Настраиваем NAT и forwarding..."
+iptables -t nat -F POSTROUTING 2>/dev/null || true
+iptables -F FORWARD 2>/dev/null || true
+
+iptables -t nat -A POSTROUTING -o ${WAN_IF} -j MASQUERADE
+
+iptables -A FORWARD -i ${WAN_IF} -o ${LAN_HQ_IF} -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -A FORWARD -i ${LAN_HQ_IF} -o ${WAN_IF} -j ACCEPT
+iptables -A FORWARD -i ${WAN_IF} -o ${LAN_BR_IF} -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -A FORWARD -i ${LAN_BR_IF} -o ${WAN_IF} -j ACCEPT
+
+iptables-save > /etc/sysconfig/iptables
+systemctl enable --now iptables 2>/dev/null || true
+
+# === 8. FRR ===
+echo "Включаем FRR..."
+sed -i 's/ospfd=no/ospfd=yes/' /etc/frr/daemons 2>/dev/null || true
+systemctl enable --now frr 2>/dev/null || true
+
+echo "======================================="
+echo "✅ Настройка ISP завершена!"
+echo "Проверь статус:"
+echo "ip a"
+echo "ip route"
+echo "iptables -t nat -L -v -n"
+echo "systemctl status network"
+echo ""
+echo "Если что-то сломалось — бэкап лежит в: $BACKUP_DIR"
+echo "======================================="
